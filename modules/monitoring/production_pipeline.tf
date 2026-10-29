@@ -1,30 +1,5 @@
 data "aws_partition" "current" {}
 data "aws_region" "current" {}
-data "aws_caller_identity" "current" {}
-
-# Production incident path: SNS -> idempotent dispatcher -> DynamoDB -> worker.
-resource "aws_dynamodb_table" "incidents" {
-  name         = "${var.env_prefix}-incidents"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "incident_id"
-
-  attribute {
-    name = "incident_id"
-    type = "S"
-  }
-
-  point_in_time_recovery {
-    enabled = true
-  }
-  server_side_encryption {
-    enabled = true
-  }
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
-  tags = merge(var.tags, { Name = "${var.env_prefix}-incidents" })
-}
 
 resource "aws_dynamodb_table" "asg_lifecycle_events" {
   name         = "${var.env_prefix}-asg-lifecycle-events"

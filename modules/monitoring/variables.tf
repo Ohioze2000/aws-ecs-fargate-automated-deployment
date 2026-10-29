@@ -39,7 +39,8 @@ variable "tags" {
 }
 
 variable "app_healthcheck_url" {
-  type = String
+  description = "URL used to verify application health."
+  type = string
 }
 
 variable "max_remediation_attempts" {
