@@ -10,7 +10,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- ENVIRONMENT VARIABLES ---
 ALB_ARN = os.getenv("ALB_ARN")
 TARGET_GROUP_ARN = os.getenv("TARGET_GROUP_ARN")
-EC2_SG_ID = os.getenv("EC2_SECURITY_GROUP_ID")
+ECS_TASK_SG_ID = os.getenv("ECS_TASK_SECURITY_GROUP_ID")
 ALB_DNS = os.getenv("ALB_DNS_NAME")
 DOMAIN_NAME = os.getenv("DOMAIN_NAME")
 APP_ENDPOINT = os.getenv("APP_ENDPOINT")
@@ -46,14 +46,14 @@ def send_slack_alert(title: str, status: str, details: str, color: str = "#ff000
 
 
 def validate_security_groups() -> bool:
-    """Ensures EC2 Security Group does not expose unrestricted public access."""
+    """Ensures the ECS task security group does not expose unrestricted public ingress."""
     print("🕵️‍♂️ Auditing Security Group ingress configurations...")
-    if not EC2_SG_ID:
-        send_slack_alert("Security Group Error", "FAILED", "EC2_SECURITY_GROUP_ID is missing.")
+    if not ECS_TASK_SG_ID:
+        send_slack_alert("Security Group Error", "FAILED", "ECS_TASK_SECURITY_GROUP_ID is missing.")
         return False
 
     try:
-        response = ec2_client.describe_security_groups(GroupIds=[EC2_SG_ID])
+        response = ec2_client.describe_security_groups(GroupIds=[ECS_TASK_SG_ID])
         permissions = response["SecurityGroups"][0].get("IpPermissions", [])
 
         for perm in permissions:
@@ -63,7 +63,7 @@ def validate_security_groups() -> bool:
                     send_slack_alert(
                         "Security Group Violation",
                         "FAILED",
-                        f"SG `{EC2_SG_ID}` allows unrestricted IPv4 access (0.0.0.0/0).",
+                        f"SG `{ECS_TASK_SG_ID}` allows unrestricted IPv4 access (0.0.0.0/0).",
                     )
                     return False
 
@@ -73,7 +73,7 @@ def validate_security_groups() -> bool:
                     send_slack_alert(
                         "Security Group Violation",
                         "FAILED",
-                        f"SG `{EC2_SG_ID}` allows unrestricted IPv6 access (::/0).",
+                        f"SG `{ECS_TASK_SG_ID}` allows unrestricted IPv6 access (::/0).",
                     )
                     return False
 

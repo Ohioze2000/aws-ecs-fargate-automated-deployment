@@ -24,7 +24,7 @@ output "alb_security_group_id" {
 }
 
 output "target_group_arn" {
-  description = "The ARN of the Target Group for Auto Scaling Group attachment"
+  description = "The ARN of the IP target group registered by the ECS Fargate service"
   value       = aws_lb_target_group.app_tg.arn
 }
 

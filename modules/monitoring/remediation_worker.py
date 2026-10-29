@@ -1,14 +1,13 @@
-"""Bounded ALB remediation with ASG lifecycle correlation and evidence-based verification."""
+"""Bounded ECS Fargate incident worker with evidence-based verification."""
 import json
 import logging
 import os
 import time
-import urllib.request
 import urllib.error
-from datetime import datetime, timezone, timedelta
+import urllib.request
+from datetime import datetime, timezone
 
 import boto3
-from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 LOG = logging.getLogger()
@@ -16,18 +15,18 @@ LOG.setLevel(logging.INFO)
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 DDB = boto3.resource("dynamodb", region_name=REGION)
 TABLE = DDB.Table(os.environ["INCIDENT_TABLE_NAME"])
-LIFECYCLE = DDB.Table(os.environ["LIFECYCLE_TABLE_NAME"])
+ECS = boto3.client("ecs", region_name=REGION)
 ELB = boto3.client("elbv2", region_name=REGION)
-ASG = boto3.client("autoscaling", region_name=REGION)
-LAM = boto3.client("lambda", region_name=REGION)
+CW = boto3.client("cloudwatch", region_name=REGION)
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-TARGET_GROUP_ARN = os.environ.get("TARGET_GROUP_ARN", "")
-APP_HEALTHCHECK_URL = os.environ.get("APP_HEALTHCHECK_URL", "")
-ROUTER_FUNCTION_NAME = os.environ.get("ROUTER_FUNCTION_NAME", "")
-ASG_NAME = os.environ.get("ASG_NAME", "")
-MAX_ATTEMPTS = int(os.environ.get("MAX_REMEDIATION_ATTEMPTS", "1"))
+CLUSTER_NAME = os.environ["CLUSTER_NAME"]
+SERVICE_NAME = os.environ["SERVICE_NAME"]
+TARGET_GROUP_ARN = os.environ["TARGET_GROUP_ARN"]
+APP_HEALTHCHECK_URL = os.environ["APP_HEALTHCHECK_URL"]
+MAX_ATTEMPTS = int(os.environ.get("MAX_REMEDIATION_ATTEMPTS", "2"))
 VERIFY_TIMEOUT = int(os.environ.get("VERIFICATION_TIMEOUT_SECONDS", "420"))
-MIN_HEALTHY_TARGETS = int(os.environ.get("MIN_HEALTHY_TARGETS", "1"))
+MIN_HEALTHY_TARGETS = int(os.environ.get("MIN_HEALTHY_TARGETS", "2"))
+TTL_DAYS = int(os.environ.get("INCIDENT_TTL_DAYS", "90"))
 
 
 def _now():
@@ -45,290 +44,213 @@ def _update(incident_id, status, **fields):
     TABLE.update_item(Key={"incident_id": incident_id}, UpdateExpression="SET " + ", ".join(sets), ExpressionAttributeNames=names, ExpressionAttributeValues=values)
 
 
-def _slack(incident, status, detail, verification):
-    """Send non-success outcomes only; verified-success is CloudWatch-gated by event_router."""
+def _slack(text):
     if not SLACK_WEBHOOK_URL:
-        raise RuntimeError("SLACK_WEBHOOK_URL is not configured")
-    text = (
-        "*AWS Self-Healing Incident Outcome*\n"
-        f"*Incident:* `{incident.get('incident_id')}`\n"
-        f"*Environment:* `{incident.get('environment')}`\n"
-        f"*Signal:* `{incident.get('signal_type')}`\n"
-        f"*Original instance:* `{incident.get('original_instance_id') or incident.get('instance_id') or 'unknown'}`\n"
-        f"*Replacement instance:* `{incident.get('replacement_instance_id') or 'not confirmed'}`\n"
-        f"*Target health check:* `{incident.get('target_health_check', 'NOT_VERIFIED')}`\n"
-        f"*Application health check:* `{incident.get('application_health_check', 'NOT_VERIFIED')}`\n"
-        f"*Capacity check:* `{incident.get('capacity_check', 'NOT_VERIFIED')}`\n"
-        f"*Remediation initiator:* `{incident.get('remediation_initiator', 'undetermined')}`\n"
-        f"*Remediation outcome:* `{incident.get('remediation_outcome', status)}`\n"
-        f"*Recovery status:* `{incident.get('recovery_status', status)}`\n"
-        f"*Final status:* `{status}`\n"
-        f"*Details:* {detail}\n*Verification:* {verification}"
+        LOG.warning("SLACK_WEBHOOK_URL is empty; Slack notification skipped")
+        return False
+    request = urllib.request.Request(SLACK_WEBHOOK_URL, data=json.dumps({"text": text}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
+        return True
+    except (urllib.error.URLError, TimeoutError, RuntimeError):
+        LOG.exception("Slack notification failed")
+        return False
+
+
+def _publish_evidence(incident, phase):
+    metric_by_phase = {
+        "DETECTED": "IncidentDetected",
+        "RECOVERED": "RemediationSuccessful",
+        "OBSERVED": "RemediationObserved",
+        "VERIFICATION_FAILED": "RemediationFailed",
+        "FAILED": "RemediationFailed",
+        "MAX_ATTEMPTS_EXCEEDED": "RemediationFailed",
+    }
+    metric_name = metric_by_phase.get(phase, "IncidentStatusUpdated")
+    CW.put_metric_data(
+        Namespace="Application/Operations",
+        MetricData=[{
+            "MetricName": metric_name,
+            "Value": 1,
+            "Unit": "Count",
+            "Timestamp": datetime.now(timezone.utc),
+            "Dimensions": [
+                {"Name": "Environment", "Value": str(incident.get("environment", "unknown"))},
+                {"Name": "SignalType", "Value": str(incident.get("signal_type", "unknown"))},
+            ],
+        }],
     )
-    request = urllib.request.Request(SLACK_WEBHOOK_URL, data=json.dumps({"text": text}).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(request, timeout=5) as response:
-        if response.status < 200 or response.status >= 300:
-            raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
 
 
-def _instance_health(instance_id):
-    if not TARGET_GROUP_ARN or not instance_id:
-        return None
-    response = ELB.describe_target_health(TargetGroupArn=TARGET_GROUP_ARN, Targets=[{"Id": instance_id}])
-    descriptions = response.get("TargetHealthDescriptions", [])
-    return descriptions[0].get("TargetHealth", {}).get("State") if descriptions else "not_registered"
-
-
-def _target_counts():
-    if not TARGET_GROUP_ARN:
-        raise RuntimeError("TARGET_GROUP_ARN is required for target health verification")
-    response = ELB.describe_target_health(TargetGroupArn=TARGET_GROUP_ARN)
-    descriptions = response.get("TargetHealthDescriptions", [])
-    healthy = sum(1 for item in descriptions if item.get("TargetHealth", {}).get("State") == "healthy")
-    unhealthy = [item.get("Target", {}).get("Id") for item in descriptions if item.get("TargetHealth", {}).get("State") == "unhealthy"]
-    return healthy, [item for item in unhealthy if item]
-
-
-def _application_health():
-    """Perform a real HTTP probe; missing configuration is never reported as passed."""
-    if not APP_HEALTHCHECK_URL:
-        return False, "APP_HEALTHCHECK_URL is not configured"
-    request = urllib.request.Request(APP_HEALTHCHECK_URL, headers={"User-Agent": "aws-incident-remediation-verifier/1.0"}, method="GET")
+def _notify(incident, phase, detail):
+    # Evidence is emitted first. If CloudWatch evidence publication fails, do not
+    # claim the notification sequence succeeded or send Slack ahead of the evidence.
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            passed = 200 <= response.status < 300
-            return passed, f"HTTP {response.status} from configured application health URL"
-    except Exception as exc:
-        return False, f"Application health probe failed: {type(exc).__name__}"
+        _publish_evidence(incident, phase)
+    except Exception:
+        LOG.exception("CloudWatch incident evidence publication failed; Slack delivery skipped")
+        return False
+    msg = (
+        f"*AWS ECS Incident {phase}*\n"
+        f"*Incident:* `{incident.get('incident_id')}`\n"
+        f"*Environment:* `{incident.get('environment', 'unknown')}`\n"
+        f"*Signal:* `{incident.get('signal_type', 'unknown')}`\n"
+        f"*Cluster / service:* `{incident.get('cluster_name', CLUSTER_NAME)}` / `{incident.get('service_name', SERVICE_NAME)}`\n"
+        f"*Alarm:* `{incident.get('alarm_name', 'target-health event')}`\n"
+        f"*Target:* `{incident.get('target_id', 'service-level')}`\n"
+        f"*Reason:* {incident.get('reason', 'No reason supplied')}\n"
+        f"*Result:* {detail}"
+    )
+    return _slack(msg)
 
 
-def _asg_snapshot():
-    response = ASG.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])
-    groups = response.get("AutoScalingGroups", [])
-    if not groups:
-        raise RuntimeError(f"Auto Scaling Group not found: {ASG_NAME}")
-    return groups[0]
-
-
-def _lifecycle_events(incident, wait_seconds=0):
-    """Read lifecycle evidence after the target-health event; retry briefly for EventBridge ordering."""
-    group = incident.get("asg_name") or ASG_NAME
-    event_time = incident.get("state_change_time") or incident.get("created_at") or _now()
+def _claim(incident_id):
+    now_epoch = int(time.time())
+    lease = now_epoch + max(VERIFY_TIMEOUT + 120, 300)
     try:
-        start = datetime.fromisoformat(event_time.replace("Z", "+00:00")) - timedelta(seconds=10)
-    except ValueError:
-        start = datetime.now(timezone.utc) - timedelta(minutes=10)
-    start_key = start.astimezone(timezone.utc).isoformat()
-    end_key = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat() + "#~"
-    deadline = time.time() + wait_seconds
-    events = []
-    while True:
-        response = LIFECYCLE.query(
-            KeyConditionExpression=Key("asg_name").eq(group) & Key("event_key").between(start_key, end_key),
-            ScanIndexForward=True,
-        )
-        events = response.get("Items", [])
-        if wait_seconds <= 0 or events or time.time() >= deadline:
-            return events
-        time.sleep(2)
-
-
-def _remediate(incident):
-    signal = incident.get("signal_type", "unknown")
-    original_id = incident.get("original_instance_id") or incident.get("instance_id")
-    incident["original_instance_id"] = original_id or ""
-    incident["remediation_initiator"] = "none"
-    incident["remediation_outcome"] = "OBSERVE_ONLY"
-    if signal != "alb_health":
-        return "OBSERVE_ONLY", f"No generic destructive action is safe for signal '{signal}'."
-    if not original_id or not ASG_NAME or not TARGET_GROUP_ARN:
-        return "FAILED_CONFIGURATION", "Original instance ID, ASG_NAME, or TARGET_GROUP_ARN is missing."
-
-    group = _asg_snapshot()
-    members = {item.get("InstanceId"): item for item in group.get("Instances", []) if item.get("InstanceId")}
-    lifecycle = _lifecycle_events(incident, wait_seconds=8)
-    original_terminations = [e for e in lifecycle if e.get("instance_id") == original_id and "Terminate" in e.get("event_type", "") and "Successful" in e.get("event_type", "")]
-    if original_id not in members:
-        incident["remediation_initiator"] = "autoscaling" if original_terminations else "external_or_autoscaling"
-        incident["remediation_outcome"] = "REPLACEMENT_ALREADY_STARTED"
-        return "REPLACEMENT_ALREADY_STARTED", (
-            f"Original instance {original_id} was already absent from the ASG before this worker requested any action; "
-            f"termination lifecycle evidence={'confirmed' if original_terminations else 'not yet observed'}. Worker did not terminate it."
-        )
-    lifecycle_state = str(members[original_id].get("LifecycleState", ""))
-    if lifecycle_state.startswith("Terminating"):
-        incident["remediation_initiator"] = "autoscaling" if original_terminations else "autoscaling_or_external"
-        incident["remediation_outcome"] = "REPLACEMENT_ALREADY_STARTED"
-        return "REPLACEMENT_ALREADY_STARTED", f"Original instance is already in ASG lifecycle state {lifecycle_state}; worker did not issue a second termination."
-
-    target_state = _instance_health(original_id)
-    if target_state != "unhealthy":
-        incident["remediation_outcome"] = "NO_ACTION"
-        return "NO_ACTION", f"Target health is '{target_state}', not confirmed unhealthy at decision time; no termination requested."
-
-    healthy_targets, _ = _target_counts()
-    if healthy_targets < MIN_HEALTHY_TARGETS:
-        incident["remediation_outcome"] = "BLOCKED_SAFETY_GUARD"
-        return "BLOCKED_SAFETY_GUARD", f"Only {healthy_targets} healthy ALB targets remain; minimum is {MIN_HEALTHY_TARGETS}. No termination performed."
-
-    # Refresh the ASG immediately before a destructive action to reduce the race with native ASG recovery.
-    latest = _asg_snapshot()
-    latest_members = {item.get("InstanceId"): item for item in latest.get("Instances", [])}
-    if original_id not in latest_members or str(latest_members[original_id].get("LifecycleState", "")).startswith("Terminating"):
-        incident["remediation_initiator"] = "autoscaling_or_external"
-        incident["remediation_outcome"] = "REPLACEMENT_ALREADY_STARTED"
-        return "REPLACEMENT_ALREADY_STARTED", "ASG state changed during the safety check; worker withheld termination and will verify the lifecycle."
-    latest_health = _instance_health(original_id)
-    if latest_health != "unhealthy":
-        incident["remediation_outcome"] = "NO_ACTION"
-        return "NO_ACTION", f"Target recovered or changed state to '{latest_health}' during the safety check; no termination requested."
-    latest_healthy, _ = _target_counts()
-    if latest_healthy < MIN_HEALTHY_TARGETS:
-        incident["remediation_outcome"] = "BLOCKED_SAFETY_GUARD"
-        return "BLOCKED_SAFETY_GUARD", f"Healthy target count fell to {latest_healthy} during the safety check; no termination performed."
-
-    ASG.terminate_instance_in_auto_scaling_group(InstanceId=original_id, ShouldDecrementDesiredCapacity=False)
-    incident["remediation_initiator"] = "worker"
-    incident["remediation_outcome"] = "ACTION_REQUESTED"
-    return "ACTION_REQUESTED", f"Worker requested bounded termination of unhealthy instance {original_id}; desired ASG capacity was not decremented."
-
-
-def _verify(incident, initial_status):
-    if initial_status not in {"ACTION_REQUESTED", "REPLACEMENT_ALREADY_STARTED"}:
-        incident["recovery_status"] = "NOT_APPLICABLE"
-        return initial_status, "No recovery claim: no replacement was requested or observed by the worker."
-
-    original_id = incident.get("original_instance_id") or incident.get("instance_id")
-    baseline = set(incident.get("asg_instance_ids_at_detection", []))
-    deadline = time.time() + VERIFY_TIMEOUT
-    last_evidence = "Waiting for ASG lifecycle and ALB health to converge."
-    while time.time() < deadline:
-        try:
-            group = _asg_snapshot()
-            members = {item.get("InstanceId"): item for item in group.get("Instances", []) if item.get("InstanceId")}
-            current_ids = set(members)
-            healthy_targets, _ = _target_counts()
-            desired = int(group.get("DesiredCapacity", 0))
-            required_healthy = max(MIN_HEALTHY_TARGETS, desired)
-            lifecycle = _lifecycle_events(incident)
-            terminations = [e for e in lifecycle if e.get("instance_id") == original_id and "Terminate" in e.get("event_type", "") and "Successful" in e.get("event_type", "")]
-            launches = [e for e in lifecycle if "Launch Successful" in e.get("event_type", "") and e.get("instance_id") and e.get("instance_id") != original_id]
-            added_ids = current_ids - baseline - ({original_id} if original_id else set())
-            launch_ids = {e.get("instance_id") for e in launches}
-            # Prefer lifecycle launches after the incident time; a replacement can launch
-            # before this Lambda snapshots the ASG, so it may already be in the baseline.
-            candidates = launch_ids if launch_ids else added_ids
-            healthy_replacements = sorted(candidate for candidate in candidates if _instance_health(candidate) == "healthy")
-            if original_id not in current_ids and healthy_targets >= required_healthy and len(healthy_replacements) == 1:
-                replacement_id = healthy_replacements[0]
-                app_passed, app_evidence = _application_health()
-                incident["replacement_instance_id"] = replacement_id
-                incident["target_health_check"] = "PASSED"
-                incident["target_health_evidence"] = f"Replacement {replacement_id} healthy; ALB healthy targets {healthy_targets}/{required_healthy}."
-                incident["capacity_check"] = "PASSED"
-                incident["capacity_evidence"] = f"ASG desired capacity={desired}; ALB healthy targets={healthy_targets}; required={required_healthy}; original instance absent."
-                incident["application_health_check"] = "PASSED" if app_passed else "FAILED"
-                incident["application_health_evidence"] = app_evidence
-                if app_passed:
-                    incident["recovery_status"] = "RECOVERY_VERIFIED"
-                    if terminations:
-                        incident["remediation_initiator"] = "autoscaling" if incident.get("remediation_initiator") != "worker" else "worker"
-                    return "RECOVERY_VERIFIED", (
-                        f"Original instance {original_id} is absent; replacement {replacement_id} is healthy; "
-                        f"ALB reports {healthy_targets} healthy targets (required {required_healthy}); "
-                        f"application probe passed ({app_evidence}); ASG termination event "
-                        f"{'observed' if terminations else 'not observed in lifecycle stream'}; "
-                        f"initiator={incident.get('remediation_initiator')}."
-                    )
-                last_evidence = f"Target and capacity checks passed, but application health failed: {app_evidence}"
-            if len(healthy_replacements) > 1:
-                last_evidence = f"Original is absent={original_id not in current_ids}; multiple new healthy candidates={healthy_replacements}; refusing to guess replacement identity."
-            else:
-                last_evidence = f"Original present={original_id in current_ids}; candidate replacements={sorted(candidates)}; healthy targets={healthy_targets}/{required_healthy}; healthy replacement candidates={healthy_replacements}; termination lifecycle event={'observed' if terminations else 'not observed'}."
-        except ClientError as exc:
-            LOG.warning("Verification poll failed: %s", exc)
-            last_evidence = f"Verification API error: {exc.response.get('Error', {}).get('Code', 'ClientError')}"
-        time.sleep(10)
-    incident["recovery_status"] = "RECOVERY_FAILED"
-    return "RECOVERY_FAILED", f"Timed out after {VERIFY_TIMEOUT}s without unambiguous replacement verification. Last evidence: {last_evidence}"
-
-
-def lambda_handler(event, context):
-    incident_id = event.get("incident_id")
-    if not incident_id:
-        raise ValueError("incident_id is required")
-    result = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True)
-    incident = result.get("Item")
-    if not incident:
-        raise ValueError(f"Incident record not found: {incident_id}")
-    try:
-        TABLE.update_item(
+        response = TABLE.update_item(
             Key={"incident_id": incident_id},
-            UpdateExpression="SET #s = :processing, attempt_count = if_not_exists(attempt_count, :zero) + :one, updated_at = :now",
-            ConditionExpression="#s IN (:received, :dispatched, :retryable) AND (attribute_not_exists(attempt_count) OR attempt_count < :max)",
+            UpdateExpression="SET #s=:processing, worker_claimed_at=:now, lease_expires_at=:lease, updated_at=:iso ADD attempt_count :one",
+            ConditionExpression="#s IN (:dispatched, :dispatch_failed, :retryable) OR (#s=:processing AND lease_expires_at < :epoch)",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":processing": "PROCESSING", ":received": "RECEIVED", ":dispatched": "DISPATCHED", ":retryable": "RETRYABLE", ":zero": 0, ":one": 1, ":max": MAX_ATTEMPTS, ":now": _now()},
+            ExpressionAttributeValues={
+                ":processing": "PROCESSING", ":dispatched": "DISPATCHED", ":dispatch_failed": "DISPATCH_FAILED",
+                ":retryable": "RETRYABLE", ":now": now_epoch, ":lease": lease, ":iso": _now(), ":one": 1, ":epoch": now_epoch,
+            },
+            ReturnValues="ALL_NEW",
         )
+        return response["Attributes"]
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            LOG.warning("Incident already claimed or attempt limit reached: %s", incident_id)
-            return {"status": "SUPPRESSED", "incident_id": incident_id}
+            LOG.info("Incident already claimed or terminal incident_id=%s", incident_id)
+            return None
         raise
 
-    incident["incident_id"] = incident_id
+
+def _service_snapshot(cluster, service):
+    response = ECS.describe_services(cluster=cluster, services=[service])
+    services = response.get("services", [])
+    if not services:
+        raise RuntimeError(f"ECS service not found: {cluster}/{service}")
+    svc = services[0]
+    return {
+        "status": svc.get("status"), "desired_count": int(svc.get("desiredCount", 0)),
+        "running_count": int(svc.get("runningCount", 0)), "pending_count": int(svc.get("pendingCount", 0)),
+        "deployments": [{"status": d.get("status"), "rollout_state": d.get("rolloutState"), "running_count": d.get("runningCount", 0), "desired_count": d.get("desiredCount", 0)} for d in svc.get("deployments", [])],
+        "events": [e.get("message", "") for e in svc.get("events", [])[:5]],
+    }
+
+def _target_snapshot(target_group_arn):
+    if not target_group_arn:
+        return {"healthy_count": 0, "unhealthy_count": 0, "targets": []}
+    response = ELB.describe_target_health(TargetGroupArn=target_group_arn)
+    targets = []
+    healthy = 0
+    unhealthy = 0
+    for item in response.get("TargetHealthDescriptions", []):
+        state = item.get("TargetHealth", {}).get("State", "unknown")
+        healthy += state == "healthy"
+        unhealthy += state in {"unhealthy", "unused", "unavailable"}
+        targets.append({"id": item.get("Target", {}).get("Id"), "port": item.get("Target", {}).get("Port"), "state": state, "reason": item.get("TargetHealth", {}).get("Reason", "")})
+    return {"healthy_count": int(healthy), "unhealthy_count": int(unhealthy), "targets": targets}
+
+def _endpoint_snapshot():
+    request = urllib.request.Request(APP_HEALTHCHECK_URL, headers={"User-Agent": "ecs-incident-verifier/1.0"})
     try:
-        action_status, detail = _remediate(incident)
-        final_status, verification = _verify(incident, action_status)
-        incident["recovery_status"] = incident.get("recovery_status", "NOT_APPLICABLE")
-        _update(
-            incident_id,
-            final_status,
-            original_instance_id=incident.get("original_instance_id", incident.get("instance_id", "")),
-            affected_instance_id=incident.get("original_instance_id", incident.get("instance_id", "")),
-            replacement_instance_id=incident.get("replacement_instance_id", ""),
-            remediation_initiator=incident.get("remediation_initiator", "undetermined"),
-            remediation_outcome=incident.get("remediation_outcome", action_status),
-            recovery_status=incident.get("recovery_status", "NOT_APPLICABLE"),
-            target_health_check=incident.get("target_health_check", "NOT_VERIFIED"),
-            target_health_evidence=incident.get("target_health_evidence", "Not verified"),
-            application_health_check=incident.get("application_health_check", "NOT_VERIFIED"),
-            application_health_evidence=incident.get("application_health_evidence", "Not verified"),
-            capacity_check=incident.get("capacity_check", "NOT_VERIFIED"),
-            capacity_evidence=incident.get("capacity_evidence", "Not verified"),
-            remediation_result=detail,
-            verification_result=verification,
-            completed_at=_now(),
-        )
-        try:
-            if final_status == "RECOVERY_VERIFIED":
-                # Do not send success directly from the worker. The router releases it
-                # only after CloudWatch has emitted ALARM -> OK and the recovery alert
-                # is recorded as delivered. This also handles either event ordering.
-                if not ROUTER_FUNCTION_NAME:
-                    raise RuntimeError("ROUTER_FUNCTION_NAME is not configured")
-                LAM.invoke(
-                    FunctionName=ROUTER_FUNCTION_NAME,
-                    InvocationType="Event",
-                    Payload=json.dumps({
-                        "source": "aws.self-healing",
-                        "detail-type": "Remediation Verification Completed",
-                        "detail": {"incident_id": incident_id},
-                    }).encode("utf-8"),
-                )
-                _update(incident_id, final_status, notification_status="WAITING_FOR_CLOUDWATCH_OK")
-            else:
-                _slack(incident, final_status, detail, verification)
-                _update(incident_id, final_status, notification_status="DELIVERED")
-        except Exception as notify_exc:
-            LOG.exception("Slack/notification handoff failed for incident %s", incident_id)
-            _update(incident_id, final_status, notification_status="FAILED", notification_error=type(notify_exc).__name__)
-        LOG.info("Incident completed incident_id=%s status=%s initiator=%s original=%s replacement=%s", incident_id, final_status, incident.get("remediation_initiator"), incident.get("original_instance_id"), incident.get("replacement_instance_id"))
-        return {"status": final_status, "incident_id": incident_id}
+        with urllib.request.urlopen(request, timeout=8) as response:
+            return {"ok": 200 <= response.status < 300, "status_code": response.status}
     except Exception as exc:
-        LOG.exception("Incident processing failed: %s", incident_id)
-        _update(incident_id, "FAILED", recovery_status="RECOVERY_FAILED", error_type=type(exc).__name__, error_message=str(exc)[:1000])
-        try:
-            _slack(incident, "FAILED", f"Processing failed: {type(exc).__name__}. Inspect CloudWatch logs.", "Recovery could not be verified.")
-        except Exception:
-            LOG.exception("Slack failure notification also failed")
+        return {"ok": False, "error": type(exc).__name__}
+
+def _alarm_state(alarm_name):
+    if not alarm_name:
+        return "UNKNOWN"
+    response = CW.describe_alarms(AlarmNames=[alarm_name])
+    alarms = response.get("MetricAlarms", [])
+    return alarms[0].get("StateValue", "UNKNOWN") if alarms else "NOT_FOUND"
+
+def _verify(incident, require_alarm_clear=True):
+    deadline = time.monotonic() + VERIFY_TIMEOUT
+    last = {}
+    cluster = incident.get("cluster_name", CLUSTER_NAME)
+    service = incident.get("service_name", SERVICE_NAME)
+    target_group = incident.get("target_group_arn", TARGET_GROUP_ARN)
+    while time.monotonic() < deadline:
+        service_data = _service_snapshot(cluster, service)
+        target_data = _target_snapshot(target_group)
+        endpoint_data = _endpoint_snapshot()
+        alarm_state = _alarm_state(incident.get("alarm_name"))
+        last = {"service": service_data, "target_health": target_data, "application_endpoint": endpoint_data, "alarm_state": alarm_state}
+        alarm_ok = (not require_alarm_clear) or alarm_state != "ALARM"
+        deployment_ok = all(d.get("rollout_state") != "FAILED" for d in service_data["deployments"])
+        capacity_ok = service_data["status"] == "ACTIVE" and service_data["running_count"] >= min(service_data["desired_count"], MIN_HEALTHY_TARGETS) and service_data["pending_count"] == 0
+        targets_ok = target_data["healthy_count"] >= MIN_HEALTHY_TARGETS and target_data["unhealthy_count"] == 0
+        if capacity_ok and targets_ok and endpoint_data.get("ok") and deployment_ok and alarm_ok:
+            last["verified_at"] = _now()
+            return True, last
+        time.sleep(15)
+    last["verification_timed_out"] = True
+    last["verified_at"] = _now()
+    return False, last
+
+def _action(incident):
+    signal = incident.get("signal_type", "unknown")
+    cluster = incident.get("cluster_name", CLUSTER_NAME)
+    service = incident.get("service_name", SERVICE_NAME)
+    # Safe signal-specific policy: CPU is handled by ECS target-tracking autoscaling;
+    # application errors are not blindly restarted because they may be a code defect.
+    # Memory, ephemeral-storage and unhealthy-target incidents get one bounded rolling
+    # replacement of tasks; the service scheduler maintains desired count throughout.
+    if signal == "cpu":
+        return "VERIFY_AUTOSCALING", "ECS target-tracking autoscaling is the CPU remediation controller; no forced restart issued."
+    if signal == "application_errors":
+        return "OBSERVE_ONLY", "Application errors require log/root-cause inspection; no blind restart was issued."
+    if signal not in {"memory", "ephemeral_storage", "unhealthy_target"}:
+        return "OBSERVE_ONLY", f"Unknown or unsupported signal '{signal}'; no infrastructure action issued."
+    ECS.update_service(cluster=cluster, service=service, forceNewDeployment=True)
+    return "FORCE_NEW_DEPLOYMENT", "Requested one rolling ECS service deployment to replace tasks; outcome remains pending verification."
+
+def lambda_handler(event, context):
+    incident_id = event.get("incident_id") if isinstance(event, dict) else None
+    if not incident_id:
+        raise ValueError("Worker requires incident_id")
+    record = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item")
+    if not record:
+        raise ValueError(f"Incident record not found: {incident_id}")
+    terminal_statuses = {"RECOVERED", "OBSERVED", "VERIFICATION_FAILED", "MAX_ATTEMPTS_EXCEEDED"}
+    if record.get("status") in terminal_statuses:
+        LOG.info("Terminal incident duplicate ignored incident_id=%s status=%s", incident_id, record.get("status"))
+        return {"status": "already_terminal", "incident_id": incident_id, "terminal_status": record.get("status")}
+    if int(record.get("attempt_count", 0)) >= MAX_ATTEMPTS:
+        _update(incident_id, "MAX_ATTEMPTS_EXCEEDED", failure_reason="Maximum remediation attempts already reached")
+        _notify(record, "FAILED", "Maximum bounded remediation attempts already reached; manual investigation required.")
+        return {"status": "max_attempts_exceeded", "incident_id": incident_id}
+    incident = _claim(incident_id)
+    if not incident:
+        return {"status": "duplicate_or_already_processing", "incident_id": incident_id}
+    try:
+        # Detection is sent before the action, and final status is sent after evidence collection.
+        detection_sent = _notify(incident, "DETECTED", "Incident accepted; bounded response and verification are starting.")
+        action, action_detail = _action(incident)
+        _update(incident_id, "VERIFYING", action=action, action_detail=action_detail, detection_notification_sent=detection_sent)
+        verified, evidence = _verify(incident, require_alarm_clear=(action != "OBSERVE_ONLY"))
+        if action == "OBSERVE_ONLY":
+            status = "OBSERVED"
+            final_detail = f"Observe-only policy. {action_detail} Verification evidence: {json.dumps(evidence, default=str)[:2500]}"
+        elif verified:
+            status = "RECOVERED"
+            final_detail = f"Recovery verified against ECS service capacity, ALB target health, and application endpoint. Action: {action}. Evidence: {json.dumps(evidence, default=str)[:2500]}"
+        else:
+            status = "VERIFICATION_FAILED"
+            final_detail = f"Recovery could not be verified before timeout. Action: {action}. Evidence: {json.dumps(evidence, default=str)[:2500]}"
+        _update(incident_id, status, action=action, action_detail=action_detail, verification_evidence=evidence, verified=bool(verified and action != "OBSERVE_ONLY"), completed_at=_now(), result_notification_sent=False)
+        result_sent = _notify(incident, status, final_detail)
+        _update(incident_id, status, result_notification_sent=result_sent)
+        return {"status": status, "incident_id": incident_id, "action": action, "verified": verified, "evidence": evidence}
+    except Exception as exc:
+        LOG.exception("Incident processing failed incident_id=%s", incident_id)
+        _update(incident_id, "RETRYABLE", failure_reason=type(exc).__name__, error_message=str(exc)[:1000])
+        _notify(incident, "FAILED", f"Processing failed with {type(exc).__name__}; inspect the incident ledger and CloudWatch logs.")
         raise

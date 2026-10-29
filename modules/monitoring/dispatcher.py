@@ -1,8 +1,13 @@
-"""SNS alarm dispatcher: validate, deduplicate, persist, and enqueue incidents."""
+"""SNS CloudWatch alarm dispatcher for ECS incidents.
+
+Persists an idempotent incident record before asynchronously invoking the worker.
+Only ALARM transitions create work; OK transitions are intentionally ignored.
+"""
 import hashlib
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import boto3
@@ -10,148 +15,115 @@ from botocore.exceptions import ClientError
 
 LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
-ddb = boto3.resource("dynamodb")
-lam = boto3.client("lambda")
-TABLE = ddb.Table(os.environ["INCIDENT_TABLE_NAME"])
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+DDB = boto3.resource("dynamodb", region_name=REGION)
+TABLE = DDB.Table(os.environ["INCIDENT_TABLE_NAME"])
+LAMBDA = boto3.client("lambda", region_name=REGION)
 WORKER_ARN = os.environ["WORKER_FUNCTION_ARN"]
 ENV_PREFIX = os.environ.get("ENV_PREFIX", "unknown")
+TTL_DAYS = int(os.environ.get("INCIDENT_TTL_DAYS", "90"))
+CLUSTER_NAME = os.environ["CLUSTER_NAME"]
+SERVICE_NAME = os.environ["SERVICE_NAME"]
+TARGET_GROUP_ARN = os.environ["TARGET_GROUP_ARN"]
 
 
-def _signal(alarm_name: str) -> str:
-    value = alarm_name.lower()
-    if "cpu" in value:
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _signal(alarm_name):
+    name = (alarm_name or "").lower()
+    if "incident-dispatcher-errors" in name or "incident-worker-errors" in name or "incident-worker-dlq" in name:
+        return None
+    if "high-cpu" in name or "cpu" in name:
         return "cpu"
-    if "memory" in value or "mem" in value:
+    if "high-memory" in name or "memory" in name:
         return "memory"
-    if "disk" in value:
-        return "disk"
-    if "unhealthy" in value or "alb" in value or "target-health" in value:
-        return "alb_health"
-    if any(token in value for token in ("app", "error", "5xx", "db", "timeout", "exception")):
-        return "application_error"
+    if "ephemeral-storage" in name or "disk" in name or "storage" in name:
+        return "ephemeral_storage"
+    if "unhealthy-target" in name or "unhealthy-host" in name or "alb" in name or "target-health" in name:
+        return "unhealthy_target"
+    if "application-error" in name or "app-error" in name:
+        return "application_errors"
     return "unknown"
 
 
+def _dimensions(trigger):
+    result = {}
+    for metric in (trigger or {}).get("Metrics", []) or []:
+        for dimension in (metric.get("MetricStat", {}).get("Metric", {}).get("Dimensions", []) or []):
+            result[dimension.get("name")] = dimension.get("value")
+    for dimension in (trigger or {}).get("Dimensions", []) or []:
+        result[dimension.get("name")] = dimension.get("value")
+    return result
+
+
+def _parse_message(message):
+    try:
+        parsed = json.loads(message)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    # CloudWatch alarm notifications include AlarmName, AlarmArn, NewStateValue, Trigger.
+    if "AlarmName" not in parsed:
+        return None
+    return parsed
+
+
 def lambda_handler(event, context):
-    records = event.get("Records", [])
-    if not records:
-        raise ValueError("Expected SNS Records in event")
-    for record in records:
-        if record.get("EventSource") != "aws:sns" and "Sns" not in record:
-            LOG.warning("Skipping non-SNS record")
+    accepted = 0
+    for record in event.get("Records", []):
+        if record.get("EventSource") != "aws:sns":
+            LOG.warning("Ignoring non-SNS record")
             continue
-        message = json.loads(record["Sns"]["Message"])
-        state = message.get("NewStateValue")
-        # OK notifications are operational state changes, not remediation requests.
-        if state != "ALARM":
-            LOG.info("Ignoring alarm state=%s alarm=%s", state, message.get("AlarmName"))
+        alarm = _parse_message(record.get("Sns", {}).get("Message", ""))
+        if not alarm:
+            LOG.warning("Ignoring non-CloudWatch SNS message")
             continue
-        alarm_name = message.get("AlarmName")
-        state_time = message.get("StateChangeTime")
-        alarm_arn = message.get("AlarmArn", alarm_name or "unknown")
-        if not alarm_name or not state_time:
-            raise ValueError("CloudWatch alarm message lacks AlarmName or StateChangeTime")
-        # Group-scoped ALB alarms are notification-only for remediation. Slack is
-        # emitted by the CloudWatch Alarm State Change EventBridge route, never SNS.
-        if _signal(alarm_name) == "alb_health":
-            LOG.info("ALB alarm state=%s alarm=%s; Slack notification is owned by CloudWatch EventBridge route", state, alarm_name)
+        if alarm.get("NewStateValue") != "ALARM":
+            LOG.info("Ignoring non-ALARM transition alarm=%s state=%s", alarm.get("AlarmName"), alarm.get("NewStateValue"))
             continue
+        alarm_arn = alarm.get("AlarmArn", alarm.get("AlarmName", "unknown"))
+        state_time = alarm.get("StateChangeTime", _now())
         incident_id = "INC-" + hashlib.sha256(f"{alarm_arn}|{state_time}".encode()).hexdigest()[:24].upper()
-        dimensions = {
-            item.get("name"): item.get("value")
-            for item in message.get("Trigger", {}).get("Dimensions", [])
-            if item.get("name") and item.get("value")
-        }
+        dims = _dimensions(alarm.get("Trigger", {}))
+        signal = _signal(alarm.get("AlarmName", ""))
+        if signal is None:
+            LOG.error("Pipeline-health alarm requires operator attention; suppressing recursive incident dispatch alarm=%s", alarm.get("AlarmName"))
+            continue
+        if signal == "unhealthy_target":
+            LOG.info("ALB target alarms are correlated by the EventBridge target-health route; skipping alarm-only duplicate alarm=%s", alarm.get("AlarmName"))
+            continue
         item = {
-            "incident_id": incident_id,
-            "alarm_arn": alarm_arn,
-            "alarm_name": alarm_name,
-            "state_change_time": state_time,
-            "signal_type": _signal(alarm_name),
-            "instance_id": dimensions.get("InstanceId", ""),
-            "dimensions": dimensions,
-            "region": message.get("Region", os.environ.get("AWS_REGION", "us-east-1")),
-            "reason": message.get("NewStateReason", "No alarm reason provided"),
-            "environment": ENV_PREFIX,
-            "status": "RECEIVED",
-            "attempt_count": 0,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "ttl": int(datetime.now(timezone.utc).timestamp()) + int(os.environ.get("INCIDENT_TTL_DAYS", "90")) * 86400,
+            "incident_id": incident_id, "source": "cloudwatch_alarm", "environment": ENV_PREFIX,
+            "alarm_name": alarm.get("AlarmName", "unknown"), "alarm_arn": alarm_arn,
+            "alarm_state": alarm.get("NewStateValue", "ALARM"), "alarm_state_at": state_time,
+            "signal_type": signal, "scope": "ecs_service",
+            "cluster_name": dims.get("ClusterName", CLUSTER_NAME),
+            "service_name": dims.get("ServiceName", SERVICE_NAME),
+            "target_group_arn": TARGET_GROUP_ARN, "dimensions": dims,
+            "reason": alarm.get("NewStateReason", "CloudWatch alarm entered ALARM"),
+            "status": "DISPATCHED", "attempt_count": 0, "created_at": _now(), "updated_at": _now(),
+            "ttl": int(time.time()) + TTL_DAYS * 86400,
         }
+        should_dispatch = False
         try:
             TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(incident_id)")
+            should_dispatch = True
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
-
-            # A prior SNS/Lambda delivery may have persisted the incident but failed
-            # before the worker accepted the async invocation. Retry only that known
-            # failure state; never redispatch completed or actively processing incidents.
-            existing = TABLE.get_item(
-                Key={"incident_id": incident_id}, ConsistentRead=True
-            ).get("Item", {})
-            if existing.get("status") != "DISPATCH_FAILED":
-                LOG.info("Duplicate alarm delivery suppressed incident_id=%s status=%s", incident_id, existing.get("status", "missing"))
-                continue
+            existing = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+            if existing.get("status") == "DISPATCH_FAILED":
+                should_dispatch = True
+                TABLE.update_item(Key={"incident_id": incident_id}, UpdateExpression="SET #s=:s, updated_at=:t", ExpressionAttributeNames={"#s":"status"}, ExpressionAttributeValues={":s":"DISPATCHED", ":t":_now()})
+            else:
+                LOG.info("Duplicate alarm ignored incident_id=%s status=%s", incident_id, existing.get("status"))
+        if should_dispatch:
             try:
-                TABLE.update_item(
-                    Key={"incident_id": incident_id},
-                    UpdateExpression="SET #s = :dispatched, updated_at = :t REMOVE dispatch_error",
-                    ConditionExpression="#s = :failed",
-                    ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={
-                        ":dispatched": "DISPATCHED",
-                        ":failed": "DISPATCH_FAILED",
-                        ":t": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-            except ClientError as claim_exc:
-                if claim_exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                    LOG.info("Dispatch retry already claimed incident_id=%s", incident_id)
-                    continue
+                LAMBDA.invoke(FunctionName=WORKER_ARN, InvocationType="Event", Payload=json.dumps({"incident_id": incident_id}).encode())
+            except Exception as exc:
+                TABLE.update_item(Key={"incident_id": incident_id}, UpdateExpression="SET #s=:s, dispatch_error=:e, updated_at=:t", ExpressionAttributeNames={"#s":"status"}, ExpressionAttributeValues={":s":"DISPATCH_FAILED", ":e":type(exc).__name__, ":t":_now()})
                 raise
-            try:
-                lam.invoke(
-                    FunctionName=WORKER_ARN,
-                    InvocationType="Event",
-                    Payload=json.dumps({"incident_id": incident_id}).encode("utf-8"),
-                )
-                LOG.warning("Retried previously failed worker dispatch incident_id=%s", incident_id)
-            except Exception:
-                TABLE.update_item(
-                    Key={"incident_id": incident_id},
-                    UpdateExpression="SET #s = :s, dispatch_error = :e, updated_at = :t",
-                    ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={
-                        ":s": "DISPATCH_FAILED",
-                        ":e": "Worker invocation failed during dispatch retry",
-                        ":t": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-                raise
-            continue
-        TABLE.update_item(
-            Key={"incident_id": incident_id},
-            UpdateExpression="SET #s = :s, updated_at = :t",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":s": "DISPATCHED", ":t": datetime.now(timezone.utc).isoformat()},
-        )
-        # Slack notifications are intentionally absent here. The CloudWatch alarm
-        # state-change route owns detection and recovery messages.
-        try:
-            lam.invoke(
-                FunctionName=WORKER_ARN,
-                InvocationType="Event",
-                Payload=json.dumps({"incident_id": incident_id}).encode("utf-8"),
-            )
-        except Exception:
-            # Keep the idempotency record and expose dispatch failure for operator reconciliation.
-            TABLE.update_item(
-                Key={"incident_id": incident_id},
-                UpdateExpression="SET #s = :s, dispatch_error = :e, updated_at = :t",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":s": "DISPATCH_FAILED", ":e": "Worker invocation failed", ":t": datetime.now(timezone.utc).isoformat()},
-            )
-            raise
-        LOG.info("Incident dispatched incident_id=%s signal=%s", incident_id, item["signal_type"])
-    return {"status": "accepted"}
+            accepted += 1
+            LOG.info("Dispatched incident_id=%s signal=%s alarm=%s", incident_id, signal, alarm.get("AlarmName"))
+    return {"status": "accepted", "dispatched": accepted}
