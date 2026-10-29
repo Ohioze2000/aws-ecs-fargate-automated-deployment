@@ -83,8 +83,8 @@ resource "aws_route53_record" "www" {
   type = "A"
 
   alias { 
-    name                   = module.alb.alb_dns_name, 
-    zone_id                = module.alb.alb_zone_id, 
+    name                   = module.alb.alb_dns_name 
+    zone_id                = module.alb.alb_zone_id 
     evaluate_target_health = true 
     }
 }
@@ -103,7 +103,18 @@ resource "aws_ecs_cluster" "app" {
 }
 resource "aws_iam_role" "task_execution" {
   name = "${var.env_prefix}-ecs-task-execution"
-  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" }, Action = "sts:AssumeRole" }] })
+  assume_role_policy = jsonencode({ 
+    Version = "2012-10-17" 
+    Statement = [
+      {  
+        Effect = "Allow" 
+        Principal = { 
+          Service = "ecs-tasks.amazonaws.com" 
+          } 
+          Action = "sts:AssumeRole" 
+          }
+          ] 
+          })
   tags = local.common_tags
 }
 resource "aws_iam_role_policy_attachment" "execution" {
@@ -127,7 +138,8 @@ resource "aws_security_group" "tasks" {
     }
   egress { 
     from_port   = 0 
-    to_port     = 0, protocol = "-1" 
+    to_port     = 0 
+    protocol = "-1" 
     cidr_blocks = ["0.0.0.0/0"] 
     }
   tags = local.common_tags
