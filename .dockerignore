@@ -1,0 +1,12 @@
+.git
+.github
+.terraform
+terraform.tfstate
+terraform.tfstate.*
+tfplan
+*.tfstate
+*.tfstate.*
+tests
+__pycache__
+*.pyc
+.DS_Store

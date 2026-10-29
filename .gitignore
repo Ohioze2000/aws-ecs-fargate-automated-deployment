@@ -1,0 +1,13 @@
+# Terraform local state and backups
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Local variables may contain secrets; keep the example file tracked.
+*.tfvars
+!terraform.tfvars.example
+
+# Generated Lambda deployment packages
+*.zip
+__pycache__/
+*.py[cod]
