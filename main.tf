@@ -70,14 +70,23 @@ resource "aws_route53_record" "apex" {
   zone_id = data.aws_route53_zone.primary.zone_id
   name = var.domain_name
   type = "A"
-  alias { name = module.alb.alb_dns_name, zone_id = module.alb.alb_zone_id, evaluate_target_health = true }
+  alias { 
+    name                   = module.alb.alb_dns_name 
+    zone_id                = module.alb.alb_zone_id 
+    evaluate_target_health = true 
+    }
 }
 resource "aws_route53_record" "www" {
   count = var.create_www_record ? 1 : 0
   zone_id = data.aws_route53_zone.primary.zone_id
   name = "www.${var.domain_name}"
   type = "A"
-  alias { name = module.alb.alb_dns_name, zone_id = module.alb.alb_zone_id, evaluate_target_health = true }
+
+  alias { 
+    name                   = module.alb.alb_dns_name, 
+    zone_id                = module.alb.alb_zone_id, 
+    evaluate_target_health = true 
+    }
 }
 resource "aws_cloudwatch_log_group" "app" {
   name = "/ecs/${var.env_prefix}/web-app"
@@ -86,7 +95,10 @@ resource "aws_cloudwatch_log_group" "app" {
 }
 resource "aws_ecs_cluster" "app" {
   name = "${var.env_prefix}-cluster"
-  setting { name = "containerInsights", value = "enabled" }
+  setting { 
+    name  = "containerInsights" 
+    value = "enabled" 
+    }
   tags = local.common_tags
 }
 resource "aws_iam_role" "task_execution" {
@@ -107,8 +119,17 @@ resource "aws_security_group" "tasks" {
   name = "${var.env_prefix}-ecs-tasks-sg"
   description = "Only ALB may connect to ECS tasks"
   vpc_id = module.network.vpc_id
-  ingress { from_port = var.container_port, to_port = var.container_port, protocol = "tcp", security_groups = [module.alb.alb_security_group_id] }
-  egress { from_port = 0, to_port = 0, protocol = "-1", cidr_blocks = ["0.0.0.0/0"] }
+  ingress { 
+    from_port       = var.container_port 
+    to_port         = var.container_port 
+    protocol        = "tcp" 
+    security_groups = [module.alb.alb_security_group_id] 
+    }
+  egress { 
+    from_port   = 0 
+    to_port     = 0, protocol = "-1" 
+    cidr_blocks = ["0.0.0.0/0"] 
+    }
   tags = local.common_tags
 }
 resource "aws_ecs_task_definition" "app" {
@@ -120,8 +141,9 @@ resource "aws_ecs_task_definition" "app" {
   execution_role_arn = aws_iam_role.task_execution.arn
   task_role_arn = aws_iam_role.task.arn
   container_definitions = jsonencode([{
-    name = "web-app", image = "${aws_ecr_repository.app.repository_url}:${var.image_tag}",
-    essential = true, portMappings = [{ containerPort = var.container_port, protocol = "tcp" }],
+    name = "web-app" 
+    image = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
+    essential = true, portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
     logConfiguration = { logDriver = "awslogs", options = {
       "awslogs-group" = aws_cloudwatch_log_group.app.name, "awslogs-region" = var.aws_region, "awslogs-stream-prefix" = "app"
     }},
@@ -144,7 +166,11 @@ resource "aws_ecs_service" "app" {
     security_groups = [aws_security_group.tasks.id]
     assign_public_ip = false
   }
-  load_balancer { target_group_arn = module.alb.target_group_arn, container_name = "web-app", container_port = var.container_port }
+  load_balancer { 
+    target_group_arn = module.alb.target_group_arn 
+    container_name = "web-app" 
+    container_port = var.container_port 
+    }
   depends_on = [module.alb, aws_iam_role_policy_attachment.execution]
   tags = local.common_tags
 }
@@ -163,7 +189,9 @@ resource "aws_appautoscaling_policy" "cpu" {
   service_namespace = aws_appautoscaling_target.ecs.service_namespace
   target_tracking_scaling_policy_configuration {
     target_value = var.target_cpu_percent
-    predefined_metric_specification { predefined_metric_type = "ECSServiceAverageCPUUtilization" }
+    predefined_metric_specification { 
+      predefined_metric_type = "ECSServiceAverageCPUUtilization" 
+      }
   }
 }
 module "monitoring" {

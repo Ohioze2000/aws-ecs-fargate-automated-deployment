@@ -37,3 +37,47 @@ variable "tags" {
   type = map(string) 
   default = {} 
   }
+
+  variable "app_healthcheck_url" {
+    type = String 
+  }
+
+  variable "max_remediation_attempts" {
+    type = number 
+    default = 2
+  }
+  variable "verification_timeout_seconds" {
+    type = number 
+    default = 90
+  }
+  variable "min_healthy_targets" {
+    type = number 
+    default = 2
+  }
+
+  variable "log_retention_in_days" {
+     type = number 
+  }
+
+  variable "cpu_alarm_threshold" {
+    type = number 
+    default = 70
+  }
+
+  variable "cpu_alarm_period" {
+    type = number 
+    default = 60
+  }
+
+  variable "cpu_evaluation_periods" {
+    type = number 
+    default = 2
+  }
+
+  variable "cpu_datapoints_to_alarm" {
+
+  }
+
+  variable "asg_name" {
+
+  }

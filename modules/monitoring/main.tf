@@ -16,10 +16,20 @@ resource "aws_dynamodb_table" "incidents" {
   name = "${var.env_prefix}-incident-ledger"
   billing_mode = "PAY_PER_REQUEST"
   hash_key = "incident_id"
-  attribute { name = "incident_id", type = "S" }
-  point_in_time_recovery { enabled = true }
-  server_side_encryption { enabled = true }
-  ttl { attribute_name = "ttl", enabled = true }
+  attribute { 
+    name = "incident_id" 
+    type = "S" 
+    }
+  point_in_time_recovery { 
+    enabled = true 
+    }
+  server_side_encryption { 
+    enabled = true 
+    }
+  ttl { 
+    attribute_name = "ttl" 
+    enabled = true 
+    }
   tags = var.tags
 }
 resource "aws_iam_role" "notifier" {
@@ -130,7 +140,12 @@ resource "aws_cloudwatch_log_metric_filter" "app_errors" {
   name = "${var.env_prefix}-application-errors"
   log_group_name = var.log_group_name
   pattern = "?ERROR ?Error ?Exception ?FATAL"
-  metric_transformation { name = "ApplicationErrors", namespace = "Application/Operations", value = "1", default_value = 0 }
+  metric_transformation { 
+    name = "ApplicationErrors" 
+    namespace = "Application/Operations" 
+    value = "1" 
+    default_value = 0 
+    }
 }
 resource "aws_cloudwatch_metric_alarm" "app_errors" {
   alarm_name = "${var.env_prefix}-Application-Error-Spike"
