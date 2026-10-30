@@ -162,15 +162,15 @@ data "archive_file" "worker" {
   output_path = "${path.module}/remediation_worker.zip"
 }
 resource "aws_lambda_function" "worker" {
-  function_name                  = "${var.env_prefix}-incident-worker"
-  role                           = aws_iam_role.worker.arn
-  runtime                        = "python3.12"
-  handler                        = "remediation_worker.lambda_handler"
-  filename                       = data.archive_file.worker.output_path
-  source_code_hash               = data.archive_file.worker.output_base64sha256
-  timeout                        = 900
-  memory_size                    = 512
-  
+  function_name    = "${var.env_prefix}-incident-worker"
+  role             = aws_iam_role.worker.arn
+  runtime          = "python3.12"
+  handler          = "remediation_worker.lambda_handler"
+  filename         = data.archive_file.worker.output_path
+  source_code_hash = data.archive_file.worker.output_base64sha256
+  timeout          = 900
+  memory_size      = 512
+
   environment { variables = {
     INCIDENT_TABLE_NAME          = aws_dynamodb_table.incidents.name
     SLACK_WEBHOOK_URL            = var.slack_webhook_url
