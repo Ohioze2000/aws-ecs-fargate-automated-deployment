@@ -279,6 +279,34 @@ jobs:
           terraform plan -out=tfplan
           terraform apply -auto-approve tfplan
 
+
+    
+      - name: Verify Terraform outputs after full apply
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking Terraform outputs..."
+
+          echo "ECR repository:"
+          terraform output -raw ecr_repository_name
+
+          echo "ECR repository URL:"
+          terraform output -raw ecr_repository_url
+
+          echo "ECS cluster:"
+          terraform output -raw ecs_cluster_name
+
+          echo "ECS service:"
+          terraform output -raw ecs_service_name
+
+          echo "Website URL:"
+          terraform output -raw website_url
+
+          echo "All required Terraform outputs are available."
+
+
+
       - name: Verify ECS deployment stability
         shell: bash
         run: |
