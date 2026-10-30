@@ -11,7 +11,7 @@ variable "env_prefix" {
 variable "force_delete" {
   description = "Allow Terraform to delete the repository even when it contains images. Keep false for normal production use."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "untagged_image_expiration_days" {
