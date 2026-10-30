@@ -12,7 +12,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ecs-platform-${{ github.ref }}
+  group: ecs-fargate-production
   cancel-in-progress: false
 
 env:
@@ -24,6 +24,11 @@ env:
   AWS_EC2_METADATA_DISABLED: "true"
 
 jobs:
+
+  # --------------------------------------------------
+  # JOB 1: VALIDATION
+  # --------------------------------------------------
+
   validate:
     name: Validate Terraform and application
     runs-on: ubuntu-latest
@@ -38,16 +43,6 @@ jobs:
           terraform_version: 1.16.5
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
           terraform_wrapper: false
-
-      # --- PIPELINE INITIALIZATION SLACK ALERT ---
-      - name: Slack Notification - Started
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_COLOR: 'good'
-          SLACK_TITLE: "Infrastructure Pipeline Status: STARTED"
-          SLACK_MESSAGE: "🚀 Triggered native Terraform Cloud remote run execution."    
 
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive
@@ -64,9 +59,19 @@ jobs:
       - name: Build website container without pushing
         run: docker build --pull -t local-web-app:ci .
 
+
+  # --------------------------------------------------
+  # JOB 2: DEPLOYMENT
+  # --------------------------------------------------
+
   deploy:
     name: Deploy ECS Fargate infrastructure
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
+
     needs: validate
     runs-on: ubuntu-latest
     environment: production
@@ -82,6 +87,24 @@ jobs:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
           terraform_wrapper: false
 
+      # --------------------------------------------------
+      # PIPELINE START NOTIFICATION
+      # --------------------------------------------------
+
+      - name: Slack Notification - Started
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_COLOR: good
+          SLACK_TITLE: ECS Fargate Deployment Started
+          SLACK_MESSAGE: >-
+            🚀 Starting infrastructure deployment for commit
+            ${{ github.sha }}.
+
+      # --------------------------------------------------
+      # AWS AUTHENTICATION
+      # --------------------------------------------------
+
       - name: Configure AWS credentials using GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -93,157 +116,99 @@ jobs:
         run: |
           set -euo pipefail
 
+          aws sts get-caller-identity
+
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
             --query Account \
             --output text)"
 
           if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
-            echo "::error::Could not determine a valid AWS account ID."
+            echo "::error::Invalid AWS account ID."
             exit 1
           fi
 
-          echo "AWS account discovered successfully."
           echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------
+      # HCP TERRAFORM INITIALIZATION
+      # --------------------------------------------------
 
       - name: Initialize HCP Terraform workspace
         run: terraform init
 
-    
       - name: Verify HCP Terraform workspace
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Terraform version:"
-          terraform version
+          ACTIVE_WORKSPACE="$(terraform workspace show)"
 
-          echo "Terraform workspace:"
-          terraform workspace show
-
-          echo "Terraform workspace configuration:"
-          echo "Organization: $TF_CLOUD_ORGANIZATION"
           echo "Expected workspace: $TF_WORKSPACE"
+          echo "Active workspace: $ACTIVE_WORKSPACE"
 
-          if [[ "$(terraform workspace show)" != "$TF_WORKSPACE" ]]; then
-            echo "::error::Terraform is using the wrong workspace."
+          if [[ "$ACTIVE_WORKSPACE" != "$TF_WORKSPACE" ]]; then
+            echo "::error::Incorrect HCP Terraform workspace."
             exit 1
           fi
 
-          echo "Terraform backend configuration:"
-          terraform init -input=false  
+          echo "HCP Terraform workspace verified."
 
-      # ECR must exist before Docker can push the application image.
-      # The ECR resources are defined inside module.ecr in root main.tf.
-      # - name: Bootstrap ECR repository with Terraform
-      #   shell: bash
-      #   run: |
-      #     set -euo pipefail
+      # --------------------------------------------------
+      # ECR BOOTSTRAP
+      # --------------------------------------------------
 
-      #     terraform apply -auto-approve \
-      #       -target=module.ecr.aws_ecr_repository.app \
-      #       -target=module.ecr.aws_ecr_lifecycle_policy.app    
-
-
-      
-      - name: Bootstrap ECR with Terraform
+      - name: Bootstrap ECR repository with Terraform
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Starting ECR bootstrap..."
 
           terraform apply -input=false -auto-approve \
             -target=module.ecr.aws_ecr_repository.app \
             -target=module.ecr.aws_ecr_lifecycle_policy.app
 
-          echo "ECR bootstrap apply completed successfully."
+          echo "ECR bootstrap completed."
 
-          echo "Verifying ECR repository in AWS..."
-
-          aws ecr describe-repositories \
-            --repository-names "$(terraform output -raw ecr_repository_name)" \
-            --region "$AWS_REGION" \
-            --query 'repositories[0].{name:repositoryName,uri:repositoryUri}' \
-            --output table
-
-
-
-
-      # These outputs must be exposed by the root Terraform configuration.
-      - name: Discover Terraform-managed resource names
+      - name: Discover ECR repository from Terraform
         shell: bash
         run: |
           set -euo pipefail
 
           ECR_REPOSITORY="$(terraform output -raw ecr_repository_name)"
           ECR_REPOSITORY_URL="$(terraform output -raw ecr_repository_url)"
-          ECS_CLUSTER_NAME="$(terraform output -raw ecs_cluster_name)"
-          ECS_SERVICE_NAME="$(terraform output -raw ecs_service_name)"
 
-          for value in \
-            "$ECR_REPOSITORY" \
-            "$ECR_REPOSITORY_URL" \
-            "$ECS_CLUSTER_NAME" \
-            "$ECS_SERVICE_NAME"; do
-            if [[ -z "$value" ]]; then
-              echo "::error::A required Terraform output is empty."
-              exit 1
-            fi
-          done
+          if [[ -z "$ECR_REPOSITORY" || -z "$ECR_REPOSITORY_URL" ]]; then
+            echo "::error::ECR Terraform outputs are missing."
+            exit 1
+          fi
 
-          # Ensure the ECR URL points to the AWS account authenticated above.
           EXPECTED_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
           if [[ "$ECR_REPOSITORY_URL" != "$EXPECTED_REGISTRY/"* ]]; then
-            echo "::error::The Terraform ECR URL does not match the authenticated AWS account and region."
+            echo "::error::ECR URL does not match the authenticated AWS account and region."
             exit 1
           fi
 
           echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> "$GITHUB_ENV"
           echo "ECR_REPOSITORY_URL=$ECR_REPOSITORY_URL" >> "$GITHUB_ENV"
-          echo "ECS_CLUSTER_NAME=$ECS_CLUSTER_NAME" >> "$GITHUB_ENV"
-          echo "ECS_SERVICE_NAME=$ECS_SERVICE_NAME" >> "$GITHUB_ENV"
 
-          echo "Terraform resource names discovered successfully."
+          echo "ECR repository discovered successfully."
 
       - name: Verify ECR repository exists
-        shell: bash
         run: |
           set -euo pipefail
 
           aws ecr describe-repositories \
             --repository-names "$ECR_REPOSITORY" \
-            --region "$AWS_REGION" \
-            --query 'repositories[0].{name:repositoryName,uri:repositoryUri}' \
-            --output table
+            --region "$AWS_REGION"
+
+      # --------------------------------------------------
+      # DOCKER BUILD AND PUSH
+      # --------------------------------------------------
 
       - name: Log in to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # The bootstrap tag is immutable. Only create it when it does not exist.
-      - name: Build and push bootstrap image if absent
-        shell: bash
-        env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
-        run: |
-          set -euo pipefail
-
-          if aws ecr describe-images \
-              --repository-name "$ECR_REPOSITORY" \
-              --image-ids imageTag=bootstrap \
-              --region "$AWS_REGION" >/dev/null 2>&1; then
-
-            echo "The immutable bootstrap image already exists."
-            echo "Skipping bootstrap image push."
-          else
-            docker build --pull \
-              -t "$REGISTRY/$ECR_REPOSITORY:bootstrap" .
-
-            docker push "$REGISTRY/$ECR_REPOSITORY:bootstrap"
-          fi
-
-      # A unique commit-based tag supports immutable ECR repositories.
       - name: Build and push commit-specific image
         shell: bash
         env:
@@ -252,21 +217,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Skip an image already pushed by an earlier run of this commit.
           if aws ecr describe-images \
               --repository-name "$ECR_REPOSITORY" \
               --image-ids "imageTag=$IMAGE_TAG" \
               --region "$AWS_REGION" >/dev/null 2>&1; then
 
-            echo "Image $IMAGE_TAG already exists; skipping push."
+            echo "Image $IMAGE_TAG already exists."
+            echo "Skipping image push."
+
           else
+
             docker build --pull \
-              -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+              -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" ./app
 
             docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
           fi
 
-      - name: Validate and apply full infrastructure
+      # --------------------------------------------------
+      # FULL INFRASTRUCTURE DEPLOYMENT
+      # --------------------------------------------------
+
+      - name: Terraform Plan
         shell: bash
         env:
           TF_VAR_image_tag: git-${{ github.sha }}
@@ -276,38 +248,55 @@ jobs:
           terraform fmt -check -recursive
           terraform validate
 
-          terraform plan -out=tfplan
-          terraform apply -auto-approve tfplan
+          terraform plan -input=false
 
+      - name: Terraform Apply
+        shell: bash
+        env:
+          TF_VAR_image_tag: git-${{ github.sha }}
+        run: |
+          set -euo pipefail
 
-    
-      - name: Verify Terraform outputs after full apply
+          terraform apply -input=false -auto-approve
+
+          echo "Full Terraform apply completed successfully."
+
+      # --------------------------------------------------
+      # ECS OUTPUT DISCOVERY
+      # --------------------------------------------------
+
+      - name: Discover ECS outputs after full apply
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking Terraform outputs..."
+          ECS_CLUSTER_NAME="$(terraform output -raw ecs_cluster_name)"
+          ECS_SERVICE_NAME="$(terraform output -raw ecs_service_name)"
+          APPLICATION_URL="$(terraform output -raw application_url)"
 
-          echo "ECR repository:"
-          terraform output -raw ecr_repository_name
+          for value in \
+            "$ECS_CLUSTER_NAME" \
+            "$ECS_SERVICE_NAME" \
+            "$APPLICATION_URL"; do
 
-          echo "ECR repository URL:"
-          terraform output -raw ecr_repository_url
+            if [[ -z "$value" ]]; then
+              echo "::error::A required Terraform output is empty."
+              exit 1
+            fi
 
-          echo "ECS cluster:"
-          terraform output -raw ecs_cluster_name
+          done
 
-          echo "ECS service:"
-          terraform output -raw ecs_service_name
+          echo "ECS_CLUSTER_NAME=$ECS_CLUSTER_NAME" >> "$GITHUB_ENV"
+          echo "ECS_SERVICE_NAME=$ECS_SERVICE_NAME" >> "$GITHUB_ENV"
+          echo "APPLICATION_URL=$APPLICATION_URL" >> "$GITHUB_ENV"
 
-          echo "Website URL:"
-          terraform output -raw website_url
+          echo "ECS outputs discovered successfully."
 
-          echo "All required Terraform outputs are available."
+      # --------------------------------------------------
+      # ECS DEPLOYMENT VERIFICATION
+      # --------------------------------------------------
 
-
-
-      - name: Verify ECS deployment stability
+      - name: Wait for ECS deployment stability
         shell: bash
         run: |
           set -euo pipefail
@@ -317,12 +306,16 @@ jobs:
             --services "$ECS_SERVICE_NAME" \
             --region "$AWS_REGION"
 
+      - name: Verify ECS service state
+        shell: bash
+        run: |
+          set -euo pipefail
+
           aws ecs describe-services \
             --cluster "$ECS_CLUSTER_NAME" \
             --services "$ECS_SERVICE_NAME" \
             --region "$AWS_REGION" \
             --query 'services[0].{
-              clusterArn:clusterArn,
               serviceName:serviceName,
               status:status,
               running:runningCount,
@@ -332,22 +325,45 @@ jobs:
             }' \
             --output json
 
-       # --- SUCCESS NOTIFICATION ---        
+      # --------------------------------------------------
+      # CAPTURE APPLICATION URL
+      # --------------------------------------------------
+
+      - name: Capture application URL
+        id: website
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "url=$APPLICATION_URL" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------
+      # SLACK SUCCESS NOTIFICATION
+      # --------------------------------------------------
+
       - name: Slack Notification - Success
         if: success()
         uses: rtCamp/action-slack-notify@v2
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_COLOR: 'good'
-          SLACK_TITLE: "✅ Deployment SUCCESSFUL"
-          SLACK_MESSAGE: "Your changes are live at: ${{ steps.vars.outputs.URL }}"
+          SLACK_COLOR: good
+          SLACK_TITLE: ECS Fargate Deployment Successful
+          SLACK_MESSAGE: >-
+            ✅ Deployment completed successfully.
+            Commit: ${{ github.sha }}
+            Application: ${{ steps.website.outputs.url }}
 
-       # --- FAILURE NOTIFICATION ---
+      # --------------------------------------------------
+      # SLACK FAILURE NOTIFICATION
+      # --------------------------------------------------
+
       - name: Slack Notification - Failure
         if: failure()
         uses: rtCamp/action-slack-notify@v2
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_COLOR: 'danger'
-          SLACK_MESSAGE: "❌ Deployment FAILED. Check GitHub Actions logs."
-          SLACK_TITLE: "Deployment Status: FAILED"     
+          SLACK_COLOR: danger
+          SLACK_TITLE: ECS Fargate Deployment Failed
+          SLACK_MESSAGE: >-
+            ❌ Deployment failed for commit ${{ github.sha }}.
+            Check GitHub Actions logs for the failed step.
