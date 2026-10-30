@@ -1,9 +1,27 @@
-variable "env_prefix" { type = string }
-variable "cluster_name" { type = string }
-variable "service_name" { type = string }
-variable "target_group_arn" { type = string }
-variable "load_balancer_dimension" { type = string }
-variable "log_group_name" { type = string }
+variable "env_prefix" {
+  type = string
+}
+
+variable "cluster_name" {
+  type = string
+}
+
+variable "service_name" {
+  type = string
+}
+
+variable "target_group_arn" {
+  type = string
+}
+
+variable "load_balancer_dimension" {
+  type = string
+}
+
+variable "log_group_name" {
+  type = string
+}
+
 variable "app_healthcheck_url" {
   description = "Public application health endpoint used for post-remediation verification."
   type        = string

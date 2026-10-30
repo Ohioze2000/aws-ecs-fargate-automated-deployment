@@ -143,13 +143,50 @@ resource "aws_iam_role_policy_attachment" "worker_logs" {
 resource "aws_iam_role_policy" "worker" {
   name = "${var.env_prefix}-incident-worker-policy"
   role = aws_iam_role.worker.id
-  policy = jsonencode({ Version = "2012-10-17", Statement = [
-    { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.incidents.arn },
-    { Effect = "Allow", Action = ["ecs:DescribeServices", "ecs:UpdateService"], Resource = "arn:${data.aws_partition.current.partition}:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:service/${var.cluster_name}/${var.service_name}" },
-    { Effect = "Allow", Action = ["elasticloadbalancing:DescribeTargetHealth"], Resource = var.target_group_arn },
-    { Effect = "Allow", Action = ["cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmsForMetric"], Resource = "*" },
-    { Effect = "Allow", Action = ["cloudwatch:PutMetricData"], Resource = "*", Condition = { StringEquals = { "cloudwatch:namespace" = "Application/Operations" } } }
-  ] })
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.incidents.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:DescribeServices", "ecs:UpdateService"]
+        Resource = "arn:${data.aws_partition.current.partition}:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:service/${var.cluster_name}/${var.service_name}"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["elasticloadbalancing:DescribeTargetHealth"]
+        Resource = var.target_group_arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmsForMetric"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "Application/Operations"
+          }
+        }
+      },
+      {
+        Sid      = "AllowSendToWorkerDeadLetterQueue"
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.worker_dlq.arn
+      }
+    ]
+  })
 }
 resource "aws_cloudwatch_log_group" "worker" {
   name              = "/aws/lambda/${var.env_prefix}-incident-worker"
