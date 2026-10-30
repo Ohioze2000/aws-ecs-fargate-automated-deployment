@@ -119,6 +119,20 @@ jobs:
             -target=module.ecr.aws_ecr_repository.app \
             -target=module.ecr.aws_ecr_lifecycle_policy.app
 
+      - name: Diagnose Terraform outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Available root outputs:"
+          terraform output
+
+          echo "Checking required output names:"
+          terraform output -raw ecr_repository_name
+          terraform output -raw ecr_repository_url
+          terraform output -raw ecs_cluster_name
+          terraform output -raw ecs_service_name      
+
       # These outputs must be exposed by the root Terraform configuration.
       - name: Discover Terraform-managed resource names
         shell: bash
