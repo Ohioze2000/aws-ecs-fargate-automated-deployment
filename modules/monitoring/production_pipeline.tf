@@ -170,7 +170,7 @@ resource "aws_lambda_function" "worker" {
   source_code_hash               = data.archive_file.worker.output_base64sha256
   timeout                        = 900
   memory_size                    = 512
-  reserved_concurrent_executions = 5
+  
   environment { variables = {
     INCIDENT_TABLE_NAME          = aws_dynamodb_table.incidents.name
     SLACK_WEBHOOK_URL            = var.slack_webhook_url
