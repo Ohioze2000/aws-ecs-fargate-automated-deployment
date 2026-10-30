@@ -134,14 +134,40 @@ jobs:
 
       # ECR must exist before Docker can push the application image.
       # The ECR resources are defined inside module.ecr in root main.tf.
-      - name: Bootstrap ECR repository with Terraform
+      # - name: Bootstrap ECR repository with Terraform
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+
+      #     terraform apply -auto-approve \
+      #       -target=module.ecr.aws_ecr_repository.app \
+      #       -target=module.ecr.aws_ecr_lifecycle_policy.app    
+
+
+      
+      - name: Bootstrap ECR with Terraform
         shell: bash
         run: |
           set -euo pipefail
 
-          terraform apply -auto-approve \
+          echo "Starting ECR bootstrap..."
+
+          terraform apply -input=false -auto-approve \
             -target=module.ecr.aws_ecr_repository.app \
-            -target=module.ecr.aws_ecr_lifecycle_policy.app    
+            -target=module.ecr.aws_ecr_lifecycle_policy.app
+
+          echo "ECR bootstrap apply completed successfully."
+
+          echo "Verifying ECR repository in AWS..."
+
+          aws ecr describe-repositories \
+            --repository-names "$(terraform output -raw ecr_repository_name)" \
+            --region "$AWS_REGION" \
+            --query 'repositories[0].{name:repositoryName,uri:repositoryUri}' \
+            --output table
+
+
+
 
       # These outputs must be exposed by the root Terraform configuration.
       - name: Discover Terraform-managed resource names
