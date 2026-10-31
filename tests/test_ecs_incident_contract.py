@@ -21,10 +21,15 @@ class ECSIncidentContractTests(unittest.TestCase):
         for signal in ("cpu", "memory", "ephemeral_storage", "unhealthy_target", "application_errors"):
             self.assertIn(signal, worker)
 
-    def test_single_sns_dispatch_path(self):
+    def test_cloudwatch_alarm_states_notify_slack_before_worker(self):
+        dispatcher = (MON / "dispatcher.py").read_text()
         pipeline = (MON / "production_pipeline.tf").read_text()
-        self.assertIn('aws_sns_topic_subscription" "dispatcher"', pipeline)
-        self.assertNotIn('aws_sns_topic_subscription" "notifier"', pipeline)
+        self.assertIn('aws_sns_topic_subscription" "dispatcher', pipeline)
+        self.assertIn('SLACK_WEBHOOK_URL   = var.slack_webhook_url', pipeline)
+        self.assertIn('{"ALARM", "OK", "INSUFFICIENT_DATA"}', dispatcher)
+        self.assertLess(dispatcher.index('_send_slack(_slack_alarm_message'), dispatcher.index('LAMBDA.invoke('))
+        self.assertIn('slack_notification_sent', dispatcher)
+        self.assertNotIn('aws_cloudwatch_event_rule" "target_health', pipeline)
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,25 +49,6 @@ resource "aws_sqs_queue" "worker_dlq" {
   tags                      = var.tags
 }
 
-resource "aws_sqs_queue" "eventbridge_dlq" {
-  name                      = "${var.env_prefix}-target-router-dlq"
-  message_retention_seconds = 1209600
-  sqs_managed_sse_enabled   = true
-  tags                      = var.tags
-}
-resource "aws_sqs_queue_policy" "eventbridge_dlq" {
-  queue_url = aws_sqs_queue.eventbridge_dlq.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "events.amazonaws.com" }
-      Action    = "sqs:SendMessage"
-      Resource  = aws_sqs_queue.eventbridge_dlq.arn
-      Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.target_health.arn } }
-    }]
-  })
-}
 
 resource "aws_iam_role" "dispatcher" {
   name               = "${var.env_prefix}-incident-dispatcher-role"
@@ -113,6 +94,7 @@ resource "aws_lambda_function" "dispatcher" {
     CLUSTER_NAME        = var.cluster_name
     SERVICE_NAME        = var.service_name
     TARGET_GROUP_ARN    = var.target_group_arn
+    SLACK_WEBHOOK_URL   = var.slack_webhook_url
   } }
   depends_on = [aws_cloudwatch_log_group.dispatcher, aws_iam_role_policy_attachment.dispatcher_logs, aws_iam_role_policy.dispatcher]
   tags       = var.tags
@@ -239,125 +221,53 @@ resource "aws_sqs_queue_policy" "worker_dlq" {
   }] })
 }
 
-resource "aws_iam_role" "router" {
-  name               = "${var.env_prefix}-incident-event-router-role"
-  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }] })
-  tags               = var.tags
-}
-resource "aws_iam_role_policy_attachment" "router_logs" {
-  role       = aws_iam_role.router.name
-  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-resource "aws_iam_role_policy" "router" {
-  name = "${var.env_prefix}-incident-router-policy"
-  role = aws_iam_role.router.id
-  policy = jsonencode({ Version = "2012-10-17", Statement = [
-    { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.incidents.arn },
-    { Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = aws_lambda_function.worker.arn }
-  ] })
-}
-resource "aws_cloudwatch_log_group" "router" {
-  name              = "/aws/lambda/${var.env_prefix}-incident-event-router"
-  retention_in_days = var.log_retention_days
-  tags              = var.tags
-}
-data "archive_file" "router" {
-  type        = "zip"
-  source_file = "${path.module}/event_router.py"
-  output_path = "${path.module}/event_router.zip"
-}
-resource "aws_lambda_function" "router" {
-  function_name    = "${var.env_prefix}-incident-event-router"
-  role             = aws_iam_role.router.arn
-  runtime          = "python3.12"
-  handler          = "event_router.lambda_handler"
-  filename         = data.archive_file.router.output_path
-  source_code_hash = data.archive_file.router.output_base64sha256
-  timeout          = 30
-  memory_size      = 256
-  environment { variables = {
-    INCIDENT_TABLE_NAME = aws_dynamodb_table.incidents.name
-    WORKER_FUNCTION_ARN = aws_lambda_function.worker.arn
-    ENV_PREFIX          = var.env_prefix
-    INCIDENT_TTL_DAYS   = tostring(var.incident_ttl_days)
-    CLUSTER_NAME        = var.cluster_name
-    SERVICE_NAME        = var.service_name
-    TARGET_GROUP_ARN    = var.target_group_arn
-  } }
-  depends_on = [aws_cloudwatch_log_group.router, aws_iam_role_policy_attachment.router_logs, aws_iam_role_policy.router]
-  tags       = var.tags
-}
-resource "aws_cloudwatch_event_rule" "target_health" {
-  name        = "${var.env_prefix}-ecs-target-health-events"
-  description = "Route unhealthy ALB target state changes for the ECS Fargate service."
-  event_pattern = jsonencode({
-    source        = ["aws.elasticloadbalancing"]
-    "detail-type" = ["ELB Target Health State Change"]
-    detail = {
-      targetGroupArn = [var.target_group_arn]
-      targetHealth   = { state = ["unhealthy", "unused", "unavailable"] }
-    }
-  })
-  tags = var.tags
-}
-resource "aws_cloudwatch_event_target" "target_health" {
-  rule      = aws_cloudwatch_event_rule.target_health.name
-  target_id = "ecs-target-health-router"
-  arn       = aws_lambda_function.router.arn
-  retry_policy {
-    maximum_event_age_in_seconds = 3600
-    maximum_retry_attempts       = 5
-  }
-  dead_letter_config { arn = aws_sqs_queue.eventbridge_dlq.arn }
-  depends_on = [aws_sqs_queue_policy.eventbridge_dlq]
-}
-resource "aws_lambda_permission" "eventbridge_router" {
-  statement_id  = "AllowEventBridgeTargetHealthRouter"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.router.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.target_health.arn
-}
+
 
 resource "aws_cloudwatch_metric_alarm" "dispatcher_errors" {
-  alarm_name          = "${var.env_prefix}-Incident-Dispatcher-Errors"
-  namespace           = "AWS/Lambda"
-  metric_name         = "Errors"
-  dimensions          = { FunctionName = aws_lambda_function.dispatcher.function_name }
-  statistic           = "Sum"
-  period              = 60
-  evaluation_periods  = 1
-  threshold           = 1
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.operations.arn]
-  tags                = var.tags
+  alarm_name                = "${var.env_prefix}-Incident-Dispatcher-Errors"
+  namespace                 = "AWS/Lambda"
+  metric_name               = "Errors"
+  dimensions                = { FunctionName = aws_lambda_function.dispatcher.function_name }
+  statistic                 = "Sum"
+  period                    = 60
+  evaluation_periods        = 1
+  threshold                 = 1
+  comparison_operator       = "GreaterThanOrEqualToThreshold"
+  treat_missing_data        = "notBreaching"
+  alarm_actions             = [aws_sns_topic.operations.arn]
+  ok_actions                = [aws_sns_topic.operations.arn]
+  insufficient_data_actions = [aws_sns_topic.operations.arn]
+  tags                      = var.tags
 }
 resource "aws_cloudwatch_metric_alarm" "worker_errors" {
-  alarm_name          = "${var.env_prefix}-Incident-Worker-Errors"
-  namespace           = "AWS/Lambda"
-  metric_name         = "Errors"
-  dimensions          = { FunctionName = aws_lambda_function.worker.function_name }
-  statistic           = "Sum"
-  period              = 60
-  evaluation_periods  = 1
-  threshold           = 1
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.operations.arn]
-  tags                = var.tags
+  alarm_name                = "${var.env_prefix}-Incident-Worker-Errors"
+  namespace                 = "AWS/Lambda"
+  metric_name               = "Errors"
+  dimensions                = { FunctionName = aws_lambda_function.worker.function_name }
+  statistic                 = "Sum"
+  period                    = 60
+  evaluation_periods        = 1
+  threshold                 = 1
+  comparison_operator       = "GreaterThanOrEqualToThreshold"
+  treat_missing_data        = "notBreaching"
+  alarm_actions             = [aws_sns_topic.operations.arn]
+  ok_actions                = [aws_sns_topic.operations.arn]
+  insufficient_data_actions = [aws_sns_topic.operations.arn]
+  tags                      = var.tags
 }
 resource "aws_cloudwatch_metric_alarm" "worker_dlq_visible" {
-  alarm_name          = "${var.env_prefix}-Incident-Worker-DLQ-Not-Empty"
-  namespace           = "AWS/SQS"
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  dimensions          = { QueueName = aws_sqs_queue.worker_dlq.name }
-  statistic           = "Maximum"
-  period              = 60
-  evaluation_periods  = 1
-  threshold           = 0
-  comparison_operator = "GreaterThanThreshold"
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.operations.arn]
-  tags                = var.tags
+  alarm_name                = "${var.env_prefix}-Incident-Worker-DLQ-Not-Empty"
+  namespace                 = "AWS/SQS"
+  metric_name               = "ApproximateNumberOfMessagesVisible"
+  dimensions                = { QueueName = aws_sqs_queue.worker_dlq.name }
+  statistic                 = "Maximum"
+  period                    = 60
+  evaluation_periods        = 1
+  threshold                 = 0
+  comparison_operator       = "GreaterThanThreshold"
+  treat_missing_data        = "notBreaching"
+  alarm_actions             = [aws_sns_topic.operations.arn]
+  ok_actions                = [aws_sns_topic.operations.arn]
+  insufficient_data_actions = [aws_sns_topic.operations.arn]
+  tags                      = var.tags
 }

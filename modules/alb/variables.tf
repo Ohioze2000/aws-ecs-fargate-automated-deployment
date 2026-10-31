@@ -22,7 +22,6 @@ variable "certificate_arn" {
 variable "health_check_path" {
   type        = string
   description = "Destination path for ALB health check probes"
-  default     = "/"
 }
 
 variable "tags" {

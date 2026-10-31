@@ -31,3 +31,8 @@ The `modules/ecr/` child module owns the immutable ECR repository, scan-on-push 
 - `modules/monitoring/`: alarm signals, durable incident ledger, dispatcher, event router, bounded remediation worker and Slack feedback.
 
 The legacy EC2/Auto Scaling Group `modules/webserver/` module has been removed. The root module connects child-module inputs and outputs. Review the root `moved` blocks and Terraform plan before applying the resource-address refactor to an existing workspace.
+
+
+## CloudWatch-first Slack notification contract
+
+All configured CloudWatch metric alarms publish state transitions to the operations SNS topic using both `alarm_actions` and `ok_actions`. The incident dispatcher sends a Slack message for `ALARM`, `OK`, and `INSUFFICIENT_DATA` transitions. For `ALARM`, the dispatcher must successfully deliver the initial Slack alert before it invokes the remediation worker. `OK` transitions are notifications only and never initiate remediation. ALB target-health remediation is driven by the CloudWatch unhealthy-target alarm, not a parallel EventBridge route, so the initial Slack notification follows the CloudWatch alarm state.
